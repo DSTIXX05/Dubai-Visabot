@@ -1,0 +1,233 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless WhatsApp visa chatbot (TypeScript, DeepSeek, DynamoDB, SQS)
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Handler: handler.handler
+    Timeout: 30
+    MemorySize: 256
+    Architectures:
+      - arm64
+    CodeUri: .
+
+Parameters:
+  DeepSeekApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: DeepSeek API key
+  WhatsAppVerifyToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Meta webhook verify token
+  WhatsAppAccessToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Meta WhatsApp Cloud API access token
+  WhatsAppPhoneNumberId:
+    Type: String
+    Default: ""
+    Description: Meta WhatsApp phone number id
+  TelegramBotToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Telegram Bot API token
+  PaymentBaseUrl:
+    Type: String
+    Default: https://pay.example.com
+    Description: Base URL for the payment checkout site
+
+Resources:
+  Table:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: visa-bot
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  InboundQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt InboundDLQ.Arn
+        maxReceiveCount: 3
+
+  InboundDLQ:
+    Type: AWS::SQS::Queue
+
+  OutboundQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OutboundDLQ.Arn
+        maxReceiveCount: 3
+
+  OutboundDLQ:
+    Type: AWS::SQS::Queue
+
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Sourcemap: true
+        Target: es2022
+        EntryPoints:
+          - src/lambdas/webhook-handler/handler.ts
+    Properties:
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref Table
+          WHATSAPP_VERIFY_TOKEN: !Ref WhatsAppVerifyToken
+          INBOUND_QUEUE_URL: !Ref InboundQueue
+      Events:
+        Webhook:
+          Type: Api
+          Properties:
+            Path: /webhook
+            Method: any
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt InboundQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref Table
+
+  TelegramWebhookFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Sourcemap: true
+        Target: es2022
+        EntryPoints:
+          - src/lambdas/telegram-webhook/handler.ts
+    Properties:
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref Table
+          INBOUND_QUEUE_URL: !Ref InboundQueue
+      Events:
+        TelegramWebhook:
+          Type: Api
+          Properties:
+            Path: /telegram-webhook
+            Method: post
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt InboundQueue.QueueName
+        - DynamoDBCrudPolicy:
+            TableName: !Ref Table
+
+  WorkerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Sourcemap: true
+        Target: es2022
+        EntryPoints:
+          - src/lambdas/conversation-worker/handler.ts
+    Properties:
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref Table
+          DEEPSEEK_API_KEY: !Ref DeepSeekApiKey
+          DEEPSEEK_MODEL: deepseek-chat
+          DEEPSEEK_BASE_URL: https://api.deepseek.com
+          PAYMENT_BASE_URL: !Ref PaymentBaseUrl
+          OUTBOUND_QUEUE_URL: !Ref OutboundQueue
+      Events:
+        Inbound:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt InboundQueue.Arn
+            BatchSize: 10
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref Table
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OutboundQueue.QueueName
+
+  OutboundFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Sourcemap: true
+        Target: es2022
+        EntryPoints:
+          - src/lambdas/outbound-sender/handler.ts
+    Properties:
+      Environment:
+        Variables:
+          WHATSAPP_ACCESS_TOKEN: !Ref WhatsAppAccessToken
+          WHATSAPP_PHONE_NUMBER_ID: !Ref WhatsAppPhoneNumberId
+          WHATSAPP_API_VERSION: v19.0
+          WHATSAPP_BASE_URL: https://graph.facebook.com
+          TELEGRAM_BOT_TOKEN: !Ref TelegramBotToken
+      Events:
+        Outbound:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OutboundQueue.Arn
+            BatchSize: 10
+
+  AdminFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: false
+        Sourcemap: true
+        Target: es2022
+        EntryPoints:
+          - src/api/admin/handler.ts
+    Properties:
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref Table
+          WHATSAPP_ACCESS_TOKEN: !Ref WhatsAppAccessToken
+          WHATSAPP_PHONE_NUMBER_ID: !Ref WhatsAppPhoneNumberId
+      Events:
+        AdminApi:
+          Type: HttpApi
+          Properties:
+            Path: /{proxy+}
+            Method: any
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref Table
+
+Outputs:
+  WebhookUrl:
+    Description: Meta webhook endpoint URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/webhook"
+  TelegramWebhookUrl:
+    Description: Telegram webhook endpoint URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/telegram-webhook"
+  AdminApiUrl:
+    Description: Admin API base URL
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"

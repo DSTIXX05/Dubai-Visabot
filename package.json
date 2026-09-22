@@ -1,0 +1,26 @@
+{
+  "name": "visa-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Serverless WhatsApp visa chatbot — TypeScript, DeepSeek, DynamoDB, SQS",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "seed": "tsx scripts/seed.ts",
+    "dev:admin": "tsx src/api/admin/server.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.637.0",
+    "@aws-sdk/client-sqs": "^3.637.0",
+    "@aws-sdk/lib-dynamodb": "^3.637.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.143",
+    "@types/node": "^20.19.43",
+    "esbuild": "^0.23.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5"
+  }
+}
