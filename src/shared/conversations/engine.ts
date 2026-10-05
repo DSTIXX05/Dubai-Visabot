@@ -9,9 +9,14 @@
 //   6. return a SafeResponse the worker enqueues for delivery
 
 import { AppConfig } from "../config";
-import { extractIntent } from "../ai/deepseek";
+import {
+  extractIntent,
+  normalizeDateWithLlm,
+  normalizePassportWithLlm,
+} from "../ai/deepseek";
 import {
   ConversationRecord,
+  getApplication,
   getConversation,
   saveConversation,
 } from "../db/dynamo";
@@ -26,22 +31,44 @@ import {
 import {
   formatProductReply,
   formatVisaOptions,
+  formatVisaRequirements,
   lookupVisaInfo,
   resolveVisaChoice,
 } from "../domain/catalogue";
+import { normalizeDate } from "../domain/dates";
+import { normalizePassport } from "../domain/passport";
 import { assessEligibility } from "../domain/assessments";
 import {
   formatApplicationSummary,
+  formatStatusReply,
   submitApplication,
 } from "../domain/applications";
 
+const MAIN_MENU: Array<{ intent: Intent; label: string }> = [
+  { intent: "visa_enquiry", label: "Ask about visa requirements or prices" },
+  { intent: "assessment", label: "Check your eligibility" },
+  { intent: "application", label: "Start an application" },
+  { intent: "status_check", label: "Check an application status" },
+];
+
 const GREETING_TEXT =
   "Hi! I'm your visa assistant. I can help you:\n" +
-  "1. Ask about visa requirements or prices\n" +
-  "2. Check your eligibility\n" +
-  "3. Start an application\n" +
-  "4. Check an application status\n\n" +
-  "How can I help?";
+  MAIN_MENU.map((item, i) => `${i + 1}. ${item.label}`).join("\n") +
+  "\n\nHow can I help?\n\nSend /restart anytime to start over.";
+
+const HANDOFF_TEXT =
+  "I've flagged your conversation for a human agent. Someone will reach out shortly.";
+
+/** Map a numeric main-menu selection (e.g. "3" or "option 2") to an intent. */
+export function resolveMainMenu(text: string): Intent | null {
+  const m = text
+    .trim()
+    .toLowerCase()
+    .match(/^(?:option\s*)?#?\s*(\d+)\s*[.)\-:]?\s*$/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return n >= 1 && n <= MAIN_MENU.length ? MAIN_MENU[n - 1].intent : null;
+}
 
 export async function handleMessage(
   message: NormalizedMessage,
@@ -54,32 +81,76 @@ export async function handleMessage(
     conv = newConversation(message.userId, now, config);
   }
 
-  const { intent, slots } = await extractIntent(
-    message.text,
-    conv.history,
-    config,
-  );
-  const mergedSlots: Slots = { ...conv.context.slots, ...slots };
+  // Global reset commands work from any state (e.g. Telegram /start, /restart).
+  // Reset the record in place so the next message starts from a blank slate.
+  if (isResetCommand(message.text)) {
+    conv.state = "IDLE";
+    conv.context = { slots: {} };
+    conv.history = [];
+    conv.updatedAt = now;
+    conv.expiresAt = ttlEpoch(config);
+    await saveConversation(conv, config.dynamoTable);
+    return {
+      status: "ok",
+      intent: "greeting",
+      replyText: GREETING_TEXT,
+      nextState: "IDLE",
+    };
+  }
 
   let result: SafeResponse;
+  let intent: Intent;
+  let mergedSlots: Slots;
 
-  if (intent === "human_handoff") {
-    result = {
-      status: "ok",
-      intent,
-      replyText:
-        "I've flagged your conversation for a human agent. Someone will reach out shortly.",
-      nextState: "HANDOFF",
-    };
-  } else if (conv.state === "APPLICATION") {
-    // Mid-form: the user's raw text is the answer to the pending field.
+  if (
+    conv.state === "APPLICATION" ||
+    conv.state === "VISA_SELECTION" ||
+    conv.state === "CONFIRM_APPLICATION" ||
+    conv.state === "STATUS_CHECK"
+  ) {
+    // Mid-flow: the user's raw text is the answer (or confirmation).
+    // Deliberately skip DeepSeek here — it can't reliably extract names, dates,
+    // emails, or visa choices, and its slots must never overwrite captured fields.
+    intent =
+      conv.state === "VISA_SELECTION"
+        ? "visa_enquiry"
+        : conv.state === "STATUS_CHECK"
+          ? "status_check"
+          : "application";
+    mergedSlots = { ...conv.context.slots };
+
     if (isCancelCommand(message.text)) {
       clearApplicationSlots(mergedSlots);
       result = {
         status: "ok",
-        replyText: `Application cancelled. ${GREETING_TEXT}`,
+        intent,
+        replyText: `Cancelled. ${GREETING_TEXT}`,
         nextState: "IDLE",
       };
+    } else if (isHandoffCommand(message.text)) {
+      intent = "human_handoff";
+      result = {
+        status: "ok",
+        intent,
+        replyText: HANDOFF_TEXT,
+        nextState: "HANDOFF",
+      };
+    } else if (conv.state === "VISA_SELECTION") {
+      mergedSlots.visa = message.text.trim();
+      result = await handleVisaSelection(mergedSlots, config);
+    } else if (conv.state === "CONFIRM_APPLICATION") {
+      result = await handleApplicationConfirmation(
+        message.text,
+        mergedSlots,
+        message.userId,
+        config,
+      );
+      if (result.nextState === "IDLE") {
+        // Submitted — drop form fields so stale data doesn't leak into the next flow.
+        clearApplicationSlots(mergedSlots);
+      }
+    } else if (conv.state === "STATUS_CHECK") {
+      result = await handleStatusLookup(message.text, message.userId, config);
     } else {
       const pending = nextApplicationField(mergedSlots);
       if (pending) {
@@ -88,13 +159,36 @@ export async function handleMessage(
       result = await handleApplication(mergedSlots, message.userId, config);
     }
   } else {
-    result = await route(
-      conv.state,
-      intent,
-      mergedSlots,
-      message.userId,
+    const { intent: extractedIntent, slots } = await extractIntent(
+      message.text,
+      conv.history,
       config,
     );
+    intent = extractedIntent;
+    mergedSlots = { ...conv.context.slots, ...slots };
+
+    // Numeric main-menu selection ("1".."4") works from IDLE/GREETING.
+    if (conv.state === "IDLE" || conv.state === "GREETING") {
+      const menuIntent = resolveMainMenu(message.text);
+      if (menuIntent) intent = menuIntent;
+    }
+
+    if (intent === "human_handoff") {
+      result = {
+        status: "ok",
+        intent,
+        replyText: HANDOFF_TEXT,
+        nextState: "HANDOFF",
+      };
+    } else {
+      result = await route(
+        conv.state,
+        intent,
+        mergedSlots,
+        message.userId,
+        config,
+      );
+    }
   }
 
   // Persist transition + append to rolling transcript.
@@ -148,6 +242,16 @@ async function route(
   switch (currentState) {
     case "ENQUIRY":
       return handleEnquiry(slots, config);
+    case "VISA_SELECTION":
+      // Normally handled in handleMessage (raw capture); fall back to enquiry.
+      return handleEnquiry(slots, config);
+    case "STATUS_CHECK":
+      return {
+        status: "ok",
+        replyText:
+          "Please share your application reference number (e.g. VISA-7K2M9Q).",
+        nextState: "STATUS_CHECK",
+      };
     case "ASSESSMENT":
       return handleAssessment(slots, config);
     case "HANDOFF":
@@ -190,8 +294,8 @@ async function handleIdle(
         status: "ok",
         intent,
         replyText:
-          "Please share your application reference number and I'll look it up.",
-        nextState: "IDLE",
+          "Please share your application reference number (e.g. VISA-7K2M9Q) and I'll look it up.",
+        nextState: "STATUS_CHECK",
       };
     default:
       return {
@@ -215,7 +319,20 @@ async function handleEnquiry(
     };
   }
   const products = await lookupVisaInfo(destination, config);
-  const replyText = formatProductReply(products, destination);
+  if (products.length === 0) {
+    return {
+      status: "ok",
+      intent: "visa_enquiry",
+      facts: { destination },
+      replyText: formatProductReply(products, destination),
+      nextState: "IDLE",
+    };
+  }
+
+  const replyText = `${formatProductReply(
+    products,
+    destination,
+  )}\n\nReply with the number or name of the visa you'd like.`;
   return {
     status: "ok",
     intent: "visa_enquiry",
@@ -225,6 +342,47 @@ async function handleEnquiry(
       price: products[0]?.priceUsd,
     },
     replyText,
+    nextState: "VISA_SELECTION",
+  };
+}
+
+/** Handle the user's answer to the numbered visa list shown after an enquiry. */
+async function handleVisaSelection(
+  slots: Slots,
+  config: AppConfig,
+): Promise<SafeResponse> {
+  const destination = slots.destination;
+  const products = destination
+    ? await lookupVisaInfo(destination, config)
+    : [];
+
+  if (products.length === 0) {
+    return handleEnquiry(slots, config);
+  }
+
+  const selected = resolveVisaChoice(slots.visa ?? "", products);
+  if (!selected) {
+    return {
+      status: "ok",
+      intent: "visa_enquiry",
+      replyText: `I didn't recognize that visa. Please choose one of:\n\n${formatVisaOptions(products)}`,
+      nextState: "VISA_SELECTION",
+    };
+  }
+
+  // Normalize the captured choice so a later "apply" can continue from here.
+  slots.visa = selected.visaType;
+
+  return {
+    status: "ok",
+    intent: "visa_enquiry",
+    facts: {
+      destination: selected.destination,
+      visa: selected.visaType,
+      currency: selected.currency,
+      price: selected.priceUsd,
+    },
+    replyText: `${formatVisaRequirements(selected)}\n\nWould you like to start an application? Reply "apply".`,
     nextState: "IDLE",
   };
 }
@@ -298,8 +456,217 @@ function clearApplicationSlots(slots: Slots): void {
   }
 }
 
+/** Normalize a travel date: deterministic rules first, DeepSeek as fallback. */
+async function normalizeTravelDate(
+  raw: string,
+  config: AppConfig,
+): Promise<string> {
+  const ruled = normalizeDate(raw);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(ruled)) return ruled;
+  const llm = await normalizeDateWithLlm(raw, config);
+  return llm ?? ruled;
+}
+
+/** Normalize a passport answer: deterministic rules first, DeepSeek as fallback. */
+async function normalizePassportValue(
+  raw: string,
+  config: AppConfig,
+): Promise<string> {
+  const ruled = normalizePassport(raw);
+  if (ruled !== raw.trim()) return ruled;
+  const llm = await normalizePassportWithLlm(raw, config);
+  return llm ?? ruled;
+}
+
+const EDITABLE_FIELDS: Array<{ field: ApplicationField; keywords: string[] }> = [
+  { field: "passport", keywords: ["passport", "nationality"] },
+  { field: "travelDate", keywords: ["travel date", "date", "travel"] },
+  { field: "name", keywords: ["name"] },
+  { field: "email", keywords: ["email", "e-mail", "mail"] },
+];
+
+/** Detect which field the user wants to edit during confirmation. */
+export function detectEditField(text: string): ApplicationField | null {
+  const t = text.toLowerCase();
+  for (const { field, keywords } of EDITABLE_FIELDS) {
+    for (const keyword of keywords) {
+      if (new RegExp(`\\b${keyword}\\b`, "i").test(t)) return field;
+    }
+  }
+  return null;
+}
+
+function promptForField(field: ApplicationField): string {
+  switch (field) {
+    case "passport":
+      return "Which passport do you hold? (e.g. Nigeria, India, United Kingdom)";
+    case "travelDate":
+      return "What is your intended travel date? (e.g. 15 October 2026)";
+    case "name":
+      return "What's your full name?";
+    case "email":
+      return "What's your email address?";
+    default:
+      return "Which country would you like a visa for?";
+  }
+}
+
+async function handleApplicationConfirmation(
+  text: string,
+  slots: Slots,
+  userId: string,
+  config: AppConfig,
+): Promise<SafeResponse> {
+  const t = text
+    .trim()
+    .toLowerCase()
+    .replace(/[.,!?]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (
+    /^(yes|yep|y|confirm|submit|ok|okay|correct|good|sure|go ahead|proceed|continue|yes please|yes submit|please submit|that'?s correct)$/.test(
+      t,
+    )
+  ) {
+    return submitApplicationFromSlots(slots, userId, config);
+  }
+
+  const field = detectEditField(t);
+  if (field) {
+    delete slots[field];
+    return {
+      status: "ok",
+      intent: "application",
+      replyText: promptForField(field),
+      nextState: "APPLICATION",
+    };
+  }
+
+  return {
+    status: "ok",
+    intent: "application",
+    replyText:
+      'Reply "yes" to submit, or tell me which field to change: passport, travel date, name, or email.',
+    nextState: "CONFIRM_APPLICATION",
+  };
+}
+
+async function submitApplicationFromSlots(
+  slots: Slots,
+  userId: string,
+  config: AppConfig,
+): Promise<SafeResponse> {
+  const products = slots.destination
+    ? await lookupVisaInfo(slots.destination, config)
+    : [];
+  const selected = resolveVisaChoice(slots.visa ?? "", products);
+
+  if (!selected) {
+    // Safety net — shouldn't happen after a confirmed form; recover gracefully.
+    return handleApplication(slots, userId, config);
+  }
+
+  const totalUsd = selected.priceUsd;
+  const currency = selected.currency;
+  const cleanAnswers: Slots = {
+    ...slots,
+    destination: selected.destination,
+    visa: selected.visaType,
+  };
+
+  const { applicationId, paymentUrl } = await submitApplication(
+    userId,
+    cleanAnswers,
+    config,
+    { totalUsd, currency },
+  );
+
+  const summary = formatApplicationSummary({
+    destination: selected.destination,
+    visa: selected.visaType,
+    passport: slots.passport ?? "",
+    travelDate: slots.travelDate ?? "",
+    name: slots.name ?? "",
+    email: slots.email ?? "",
+    totalUsd,
+    currency,
+  });
+
+  return {
+    status: "ok",
+    intent: "application",
+    facts: { applicationId, totalUsd, currency },
+    replyText: `${summary}\n\nApplication reference: ${applicationId}\n\nComplete your payment here:\n${paymentUrl}`,
+    nextState: "IDLE",
+  };
+}
+
+const REFERENCE_PATTERN = /\bVISA-[A-Z0-9]{4,12}\b/i;
+
+/** Extract an application reference from a status-check message. */
+export function extractReference(text: string): string | null {
+  const m = text.match(REFERENCE_PATTERN);
+  if (m) return m[0].toUpperCase();
+
+  const bare = text.trim().match(/^([A-Z0-9-]{4,20})$/i);
+  if (bare && /\d/.test(bare[1])) {
+    const code = bare[1].toUpperCase();
+    return code.startsWith("VISA-") ? code : `VISA-${code}`;
+  }
+  return null;
+}
+
+async function handleStatusLookup(
+  text: string,
+  userId: string,
+  config: AppConfig,
+): Promise<SafeResponse> {
+  const ref = extractReference(text);
+
+  if (!ref) {
+    return {
+      status: "ok",
+      intent: "status_check",
+      replyText:
+        "Please share your application reference number (e.g. VISA-7K2M9Q).",
+      nextState: "STATUS_CHECK",
+    };
+  }
+
+  const app = await getApplication(userId, ref, config.dynamoTable);
+
+  if (!app) {
+    return {
+      status: "ok",
+      intent: "status_check",
+      replyText: `I couldn't find an application with reference "${ref}". Please double-check the number and try again.`,
+      nextState: "STATUS_CHECK",
+    };
+  }
+
+  return {
+    status: "ok",
+    intent: "status_check",
+    facts: { applicationId: app.applicationId, stage: app.stage },
+    replyText: formatStatusReply(app),
+    nextState: "IDLE",
+  };
+}
+
 function isCancelCommand(text: string): boolean {
   return /^(cancel|restart|start over|reset|quit)$/i.test(text.trim());
+}
+
+/** Global reset commands — Telegram /start and /restart (with optional @botname suffix). */
+export function isResetCommand(text: string): boolean {
+  return /^\/(?:start|restart)(?:@\w+)?$/i.test(text.trim());
+}
+
+function isHandoffCommand(text: string): boolean {
+  return /(talk|speak)\s+to\s+(a\s+)?(human|agent|person|representative)|customer\s+service|real\s+person/i.test(
+    text.trim(),
+  );
 }
 
 async function handleApplication(
@@ -347,19 +714,21 @@ async function handleApplication(
   if (!slots.passport) {
     return {
       status: "ok",
-      replyText:
-        "Which passport do you hold? (e.g. Nigeria, India, United Kingdom)",
+      replyText: `${formatVisaRequirements(selected)}\n\nWhich passport do you hold? (e.g. Nigeria, India, United Kingdom)`,
       nextState: "APPLICATION",
     };
   }
+  slots.passport = await normalizePassportValue(slots.passport, config);
+
   // 4. Travel date
   if (!slots.travelDate) {
     return {
       status: "ok",
-      replyText: "What is your intended travel date? (e.g. 2026-10-15)",
+      replyText: "What is your intended travel date? (e.g. 15 October 2026)",
       nextState: "APPLICATION",
     };
   }
+  slots.travelDate = await normalizeTravelDate(slots.travelDate, config);
   // 5. Name
   if (!slots.name) {
     return {
@@ -377,22 +746,7 @@ async function handleApplication(
     };
   }
 
-  // All fields collected — submit and show summary + payment link.
-  const totalUsd = selected.priceUsd;
-  const currency = selected.currency;
-  const cleanAnswers: Slots = {
-    ...slots,
-    destination: selected.destination,
-    visa: selected.visaType,
-  };
-
-  const { applicationId, paymentUrl } = await submitApplication(
-    userId,
-    cleanAnswers,
-    config,
-    { totalUsd, currency },
-  );
-
+  // All fields collected — show a confirmation before creating the application.
   const summary = formatApplicationSummary({
     destination: selected.destination,
     visa: selected.visaType,
@@ -400,15 +754,20 @@ async function handleApplication(
     travelDate: slots.travelDate ?? "",
     name: slots.name ?? "",
     email: slots.email ?? "",
-    totalUsd,
-    currency,
+    totalUsd: selected.priceUsd,
+    currency: selected.currency,
   });
 
   return {
     status: "ok",
     intent: "application",
-    facts: { applicationId, totalUsd, currency },
-    replyText: `${summary}\n\nComplete your payment here:\n${paymentUrl}`,
-    nextState: "IDLE",
+    facts: {
+      destination: selected.destination,
+      visa: selected.visaType,
+      totalUsd: selected.priceUsd,
+      currency: selected.currency,
+    },
+    replyText: `${summary}\n\nReply "yes" to submit, or tell me what to change (passport, travel date, name, or email).`,
+    nextState: "CONFIRM_APPLICATION",
   };
 }

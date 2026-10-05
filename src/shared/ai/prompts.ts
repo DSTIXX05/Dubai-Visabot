@@ -13,6 +13,8 @@ Classify intent as exactly one of:
 - human_handoff     (asks to talk to a human/agent)
 - unknown
 
+Use the conversation history (previous user/assistant turns) to resolve context — pronouns, short answers like "6" or "the first one", and countries or visa choices mentioned in earlier turns. The final user message is the one you must classify.
+
 Extract these slots when present (otherwise omit them):
 - destination  (country the user wants to visit)
 - nationality  (user's nationality)

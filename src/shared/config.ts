@@ -42,6 +42,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
 
     paymentBaseUrl: env.PAYMENT_BASE_URL ?? "https://pay.example.com",
     conversationTtlHours: Number(env.CONVERSATION_TTL_HOURS ?? 24),
-    maxHistoryMessages: Number(env.MAX_HISTORY_MESSAGES ?? 10),
+    maxHistoryMessages: Number(env.MAX_HISTORY_MESSAGES ?? 3),
   };
 }

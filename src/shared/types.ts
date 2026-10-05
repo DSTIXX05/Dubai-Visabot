@@ -4,8 +4,11 @@ export type ConversationState =
   | "IDLE"
   | "GREETING"
   | "ENQUIRY"
+  | "VISA_SELECTION"
   | "ASSESSMENT"
   | "APPLICATION"
+  | "CONFIRM_APPLICATION"
+  | "STATUS_CHECK"
   | "HANDOFF";
 
 export type Intent =

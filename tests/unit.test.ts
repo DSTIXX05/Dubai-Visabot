@@ -4,6 +4,12 @@ import {
   MetaWebhookPayload,
 } from "../src/shared/whatsapp/schemas";
 import { fallbackIntent } from "../src/shared/ai/deepseek";
+import {
+  detectEditField,
+  extractReference,
+  isResetCommand,
+  resolveMainMenu,
+} from "../src/shared/conversations/engine";
 
 describe("normalizePayload", () => {
   it("flattens a Meta message event into normalized messages", () => {
@@ -67,5 +73,72 @@ describe("fallbackIntent", () => {
     expect(fallbackIntent("what visa do I need for Canada").intent).toBe(
       "visa_enquiry",
     );
+  });
+});
+
+describe("isResetCommand", () => {
+  it("matches /start and /restart (with optional botname)", () => {
+    expect(isResetCommand("/start")).toBe(true);
+    expect(isResetCommand("/restart")).toBe(true);
+    expect(isResetCommand("/start@MyVisaBot")).toBe(true);
+    expect(isResetCommand("/restart@MyVisaBot")).toBe(true);
+  });
+
+  it("ignores other messages", () => {
+    expect(isResetCommand("start")).toBe(false);
+    expect(isResetCommand("I want a visa")).toBe(false);
+    expect(isResetCommand("/help")).toBe(false);
+  });
+});
+
+describe("detectEditField", () => {
+  it("detects editable fields from confirmation replies", () => {
+    expect(detectEditField("change passport")).toBe("passport");
+    expect(detectEditField("the travel date is wrong")).toBe("travelDate");
+    expect(detectEditField("my name")).toBe("name");
+    expect(detectEditField("email please")).toBe("email");
+  });
+
+  it("does not confuse 'date' with 'update'", () => {
+    expect(detectEditField("I want to update my name")).toBe("name");
+  });
+
+  it("returns null for non-edit answers", () => {
+    expect(detectEditField("yes")).toBeNull();
+    expect(detectEditField("no idea")).toBeNull();
+  });
+});
+
+describe("extractReference", () => {
+  it("extracts a reference from a message", () => {
+    expect(extractReference("VISA-7K2M9QX4")).toBe("VISA-7K2M9QX4");
+    expect(extractReference("status of visa-7k2m9qx4 please")).toBe(
+      "VISA-7K2M9QX4",
+    );
+    expect(extractReference("7K2M9QX4")).toBe("VISA-7K2M9QX4");
+  });
+
+  it("returns null when no reference is present", () => {
+    expect(extractReference("hello")).toBeNull();
+    expect(extractReference("")).toBeNull();
+  });
+});
+
+describe("resolveMainMenu", () => {
+  it("maps numbers to intents", () => {
+    expect(resolveMainMenu("1")).toBe("visa_enquiry");
+    expect(resolveMainMenu("2")).toBe("assessment");
+    expect(resolveMainMenu("3")).toBe("application");
+    expect(resolveMainMenu("4")).toBe("status_check");
+  });
+
+  it("accepts option markers and punctuation", () => {
+    expect(resolveMainMenu("option 2")).toBe("assessment");
+    expect(resolveMainMenu("3)")).toBe("application");
+  });
+
+  it("returns null for out-of-range or non-numeric input", () => {
+    expect(resolveMainMenu("5")).toBeNull();
+    expect(resolveMainMenu("hello")).toBeNull();
   });
 });
